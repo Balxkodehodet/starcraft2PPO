@@ -35,6 +35,8 @@ Dette repositoriet inneholder et oppsett for forsterkende læring (Reinforcement
 ## Funksjoner
 
 - **PPO-agent** med CNN-policy for visuelle observasjoner.
+- Agenten spiller mot en easy starcraft 2 bot i hoved filen som brukes (train_maskable_ppo_sc2.py)
+- Masked actions sørger for at agenten velger valide handlinger av de 572 handlingene som er tilgjengelige.
 - Formede belønninger som kombinerer:
   - Endring i poengsum
   - Mineraler samlet
