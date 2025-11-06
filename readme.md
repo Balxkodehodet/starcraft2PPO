@@ -41,7 +41,7 @@ Dette repositoriet inneholder et oppsett for forsterkende læring (Reinforcement
   - Trenede arbeidere
   - Bruk av supply depot
   - Straff for inaktive arbeidere
-- Støtte for self-play: agenten kan trene mot seg selv eller en fryst motspiller.
+- Støtte for self-play: agenten kan trene mot seg selv eller en fryst motspiller. (Ikke helt ferdig skrevet kode ennå)
 - TensorBoard-logging for episoderesultater.
 - Parallell trening med flere miljøer ved bruk av `SubprocVecEnv`.
 
@@ -78,13 +78,13 @@ Anbefaling: Bruk en headless-versjon for raskere trening (visualize=False i SC2E
 
 Bruk
 Trening
-python train_maskable_ppo_sc2.py
+python train_maskable_ppo_sc2.py <<-- Denne filen er hoved agenten, filen fungerer og de andre fungerer ikke optimalt ennå.
 
 Dette vil opprette flere parallelle miljøer og trene PPO-agenten mot en easy bot (ikke selv læring)
 
 Modell-sjekkpunkter lagres periodisk via SaveEveryNStepsCallback.
 
-TensorBoard-logger lagres i ./ppo_sc2_logs/.
+TensorBoard-logger lagres i ./ppo_sc2_logs/. eller ./maskable_ppo_sc2_logs/ <<-- denne brukes akkurat nå
 
 Evaluering / Self-Play
 
@@ -120,13 +120,20 @@ Python 3.10 er nødvendig for kompatibilitet med PySC2.
 
 Formede belønninger sørger for at agenten blir incentivert til å trene arbeidere, samle ressurser og bygge en effektiv hær.
 
+- Tensorboard bruk:
+
+  1.Åpne en terminal (cmd) eller den terminal du bruker
+  2.Skriv i terminalen: ` tensorboard --logdir=MappenMedLogsHer`
+  3.Åpne tensorboard i localhost, som oftest brukes port 6006
+  4.Her kan du se mine logs eller se dine egne logs på treningen som er utført på ppo agenten.
+
 Lisens
 
 MIT-lisens. Du kan fritt modifisere eller utvide dette repositoriet for forskning eller egne prosjekter.
 
 Forfatter
 
-Utviklet av [balxkodehodet]
+Utviklet av [balxkodehodet] & ChatGPT (ChatGPT skrev mesteparten av koden og jeg korrigerte eller forbedret koden ved å både skrive selv og spørre chatgpt mer detaljerte forespørsler)
 
 Basert på implementasjoner fra PySC2 og Stable-Baselines3
 
