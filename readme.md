@@ -1,6 +1,6 @@
 Kort forklart:
 
-Denne agenten lærer å spille StarCraft II ved hjelp av en metode innen maskinlæring som kalles forsterkende læring (Reinforcement Learning, RL).
+Denne agenten lærer å spille StarCraft II ved hjelp av en metode innen maskinlæring/kunstig intelligens(AI/KI) som kalles forsterkende læring (Reinforcement Learning, RL).
 Agenten får poeng (belønninger) for gode handlinger og straff for dårlige, og prøver over tid å maksimere summen av belønninger.
 
 Hvordan det fungerer
