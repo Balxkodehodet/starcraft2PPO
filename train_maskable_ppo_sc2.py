@@ -27,6 +27,7 @@ import torch
 from sb3_contrib.common.maskable.utils import get_action_masks
 from sb3_contrib.common.wrappers.action_masker import ActionMasker
 from collections import deque
+from stable_baselines3.common.monitor import Monitor
 
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from sb3_contrib.ppo_mask import MaskablePPO
@@ -38,14 +39,93 @@ FEATURE_SCREEN_SIZE = 84
 TOTAL_TIMESTEPS = 1000000
 NUM_ENVS = 3
 MODEL_PATH = "maskable_ppo_sc2.zip"
+START_STEPS = 400 #How many timesteps should an episode last for in the beginning?
+CHECK_FREQ = 200 #How many episodes should pass before checking reward mean
+TARGET_RATE = 0.7 # Average reward each step before upgrading to next curriculum
+INC_STEPS = 200 #How many timesteps should each level increase the episode
 # ---------------------------------------
 
+class CurriculumCallback(BaseCallback):
+    def __init__(self,env,target_rate=TARGET_RATE, increase_steps=INC_STEPS, check_freq=CHECK_FREQ, verbose=1):
+        super().__init__(verbose)
+        self.env = env
+        self.target_rate = target_rate
+        self.increase_steps = increase_steps
+        self.check_freq = check_freq
+        self.reward_rates = []
+    def _on_step(self):
+        infos = self.locals["infos"]
+        for info in infos:
+            final = info.get("final_info") or info.get("terminal_observation")
+            if final is not None:
+                ep_info = info.get("episode")
+                if ep_info is not None:
+                    r = ep_info["r"]
+
+                    l = ep_info["l"]
+
+                    reward_rate = r / max(l, 1)
+                    print(f"Episode reward rate: {reward_rate}") 
+                    self.reward_rates.append(reward_rate)
+
+        # Check curriculum every check_freq episodes
+        if len(self.reward_rates) >= self.check_freq:
+            mean_rate = np.mean(self.reward_rates[-self.check_freq:])
+            print(f"Mean rate over the last {self.check_freq} episodes: {mean_rate}")
+
+            if mean_rate >= self.target_rate:
+                #Increase in all envs
+                for e in self.env.envs:
+                    e.max_episode_steps += self.increase_steps
+                    
+                print(f"Successfully achieved higher mean rate than target rate")
+                if self.verbose:
+                    print(f"Curriculum: Increased max steps -> {self.env.envs[0].max_episode_steps}")
+
+            self.reward_rates = []        
+            
+        return True
+
+class CurriculumWrapper(gym.Wrapper):
+    def __init__(self, env, start_steps=START_STEPS):
+        super().__init__(env)
+        self.max_episode_steps=start_steps
+        self.current_step = 0
+
+    def reset(self, **kwargs):
+        self.current_step = 0
+        obs, info = self.env.reset(**kwargs)
+        return obs, info
+
+    def step(self, action):
+        self.current_step += 1
+
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        # Force episode termination if max steps reached
+        if self.current_step >= self.max_episode_steps:
+            truncated = True
+            info["TimeLimit.truncated"] = True
+            
+        return obs, reward, terminated, truncated, info
+
 class ShapedRewardCallback(BaseCallback):
-    def __init__(self, verbose=0):
+    def __init__(self, base_log_dir="./maskable_ppo_sc2_logs", verbose=0):
         super(ShapedRewardCallback, self).__init__(verbose)
-        self.writer = SummaryWriter(log_dir="./maskable_ppo_sc2_logs/episode_reward")
+        self.base_log_dir = base_log_dir
         self.episode_rewards = {}
         self.episode_count = 0
+        self.writer = None  # writer will be created dynamically
+
+    def _init_writer(self):
+        """Create a new folder and writer for the current episode."""
+        run_dir = os.path.join(self.base_log_dir, f"run_{self.episode_count:05d}")
+        os.makedirs(run_dir, exist_ok=True)
+        if self.writer:
+            self.writer.close()
+        self.writer = SummaryWriter(log_dir=run_dir)
+        if self.verbose > 0:
+            print(f"[TensorBoard] Started new run: {run_dir}")    
 
     def _on_step(self):
         infos = self.locals.get("infos", [])
@@ -57,23 +137,20 @@ class ShapedRewardCallback(BaseCallback):
             info = infos[i]
             done = dones[i]
 
-            shaped = (
-                0.5 * rewards[i]
-                + 0.3 * info.get("delta_score", 0)
-                + 0.05 * info.get("delta_minerals", 0)
-                + 0.05 * info.get("delta_workers", 0)
-                + 0.1 * info.get("delta_supply_depot", 0)
-                - 0.2 * info.get("delta_idle_workers", 0)
-            )
+            shaped = rewards[i]
 
             self.episode_rewards[i] = self.episode_rewards.get(i, 0) + shaped
 
             if done:
+                # Start new log folder for this episode
+                self._init_writer()
+                
                 self.writer.add_scalar(
                     "Rewards/ShapedReward_episode",
                     self.episode_rewards[i],
                     self.episode_count,
                 )
+                print(f"Episode {self.episode_count} done")
                 self.episode_rewards[i] = 0
                 self.episode_count += 1
 
@@ -157,12 +234,15 @@ class SC2ContinuousCNNEnv(gym.Env):
         self.action_space = spaces.MultiDiscrete([len(self.valid_funcs), 64, 64])
 
         self._last_obs = None
+        self._first_time = 0
         self._prev_score = 0.0
         self._prev_kills = 0.0
         self._prev_minerals = 0.0
         self._prev_workers = 0.0
         self._prev_idle_workers = 0.0
         self._prev_supply_despot = 0.0
+        self._prev_vespene = 0.0
+        self._prev_army_power = 0.0
 
 
     def reset(self, seed=None, options=None):
@@ -221,6 +301,8 @@ class SC2ContinuousCNNEnv(gym.Env):
         self._prev_workers = 0.0
         self._prev_idle_workers = 0.0
         self._prev_supply_despot = 0.0
+        self._prev_vespene = 0.0
+        self._prev_army_power = 0.0
 
         info = {}
 
@@ -320,12 +402,14 @@ class SC2ContinuousCNNEnv(gym.Env):
             player_obs = obs.observation["player"]
             score = score_cumulative[0]
             gathered = score_cumulative[7]
+            vespene = score_cumulative[8]
             workers = player_obs[6]
             idle_workers = player_obs[7]
             supply_despot = player_obs[4]
+            army_power = player_obs[5]
         except (KeyError, AttributeError, TypeError):
             print("KeyError, AttributeError or TypeError")
-            score = gathered = workers = idle_workers = supply_despot = 0.0
+            score = gathered = vespene = army_power = workers = idle_workers = supply_despot = 0.0
 
         #print(f"gathered minerals:",gathered)
         #print(f"score:", score)
@@ -343,27 +427,46 @@ class SC2ContinuousCNNEnv(gym.Env):
             delta_workers = workers - self._prev_workers
             delta_idle_workers = idle_workers - self._prev_idle_workers
             delta_supply_despot = supply_despot - self._prev_supply_despot
+            delta_vespene = vespene - self._prev_vespene
+            delta_army_power = army_power - self._prev_army_power
         else:
-            delta_score = delta_minerals = delta_workers = delta_idle_workers = delta_supply_despot = 0
+            delta_score = delta_minerals = delta_vespene = delta_army_power = delta_workers = delta_idle_workers = delta_supply_despot = 0
 
         #print("delta minerals:", delta_minerals)
         #print("delta score:", delta_score)
 
+        first_time_reward = 0
+        #Reward the first time it builds a supply despot or if episode reward is above 20
+        if self._first_time == 1:
+            if delta_supply_despot > 0 or self.episode_reward > 20.0 or delta_workers > 0:
+                self._first_time = 2
+                first_time_reward = 2.0
+                print(f"Congratulations! You did something good for the first time! Rewarded {first_time_reward} extra points")
+
+        # Set first time +1 ONLY if it is the first time it steps to avoid rewards being given for free because prevs are 0
+        if self._first_time == 0:
+            self._first_time += 1
+
+            
         self._prev_score = score
         #self._prev_kills = killed
         self._prev_minerals = gathered
         self._prev_workers = workers
         self._prev_idle_workers = idle_workers
         self._prev_supply_despot = supply_despot
+        self._prev_vespene = vespene
+        self._prev_army_power = army_power
 
         # --- Normalization ---
         # Cap large jumps to keep PPO stable
-        delta_score = np.clip(delta_score, -100, 100) / 100.0
-        #delta_kills = np.clip(delta_kills, -50, 50) / 50.0
-        delta_minerals = np.clip(delta_minerals, -500, 500) / 500.0
-        delta_workers = np.clip(delta_workers, -5, 5) / 5.0
+        delta_score = np.clip(delta_score, -100, 100) / 100.0 # General Score
+        #delta_kills = np.clip(delta_kills, -50, 50) / 50.0 # Kills (not yet found)
+        delta_minerals = np.clip(delta_minerals, -500, 500) / 500.0 # Minerals gathered
+        delta_workers = np.clip(delta_workers, -5, 5) / 5.0 # Power of workers 
         delta_idle_workers = np.clip(delta_idle_workers, 0, 20) / 20.0  # only penalize positive idle change
-        delta_supply_despot = np.clip(delta_supply_despot, -8, 8) / 8.0
+        delta_supply_despot = np.clip(delta_supply_despot, -8, 8) / 8.0 # Supply despots nr
+        delta_vespene = np.clip(delta_vespene, -500, 500) / 500.0 # Vespene gathered
+        delta_army_power = np.clip(delta_army_power, -5, 5) / 5.0 # Army power
 
         #print("delta minerals after cap:", delta_minerals)
         #print("delta score after cap:", delta_score)
@@ -381,6 +484,8 @@ class SC2ContinuousCNNEnv(gym.Env):
             0.5 * reward
             + 0.3 * delta_score
             #+ 0.15 * delta_kills
+            + 0.15 * delta_army_power #reward for having supply used for army units  
+            + 0.05 * delta_vespene
             + 0.05 * delta_minerals
             + 0.05 * delta_workers  # reward for training new workers
             + 0.1 * delta_supply_despot
@@ -389,6 +494,8 @@ class SC2ContinuousCNNEnv(gym.Env):
 
         # Add penalty from repeated actions
         shaped_reward += repeat_penalty
+
+        shaped_reward += first_time_reward
         
         # track episode total
         self.episode_reward += shaped_reward
@@ -403,11 +510,9 @@ class SC2ContinuousCNNEnv(gym.Env):
         terminated = done
         truncated = False  # or implement a max-steps limit
 
-        if done:
-            # Track episode
-            self.episode += 1
+        if done or truncated or terminated:
             
-            print(f"Episode {self.episode} finished. Reward/result: {reward}, Valid actions: {self.valid_action_count}, invalid actions {self.invalid_action_count}, episode reward: {self.episode_reward}, Total steps: {self.episode_steps}")
+            print(f"Episode finished. Reward/result: {reward}, Valid actions: {self.valid_action_count}, invalid actions {self.invalid_action_count}, episode reward: {self.episode_reward}, Total steps: {self.episode_steps}")
             # Reset episode stats
             self.valid_action_count = 0
             self.episode_steps = 0
@@ -444,6 +549,8 @@ def make_env(mask_fn):
     def _init():
         env = SC2ContinuousCNNEnv()
         env = ActionMasker(env, mask_fn)
+        #env = CurriculumWrapper(env)
+        #env = Monitor(env)
         return env
     return _init
 
@@ -456,6 +563,8 @@ if __name__ == "__main__":
     save_callback = SaveEveryNStepsCallback(save_freq=10_000, save_path="./")
 
     shaped_callback = ShapedRewardCallback()
+
+    curr_callback = CurriculumCallback(env, target_rate=TARGET_RATE, increase_steps=INC_STEPS)
     callback = CallbackList([save_callback, shaped_callback])
 
     if os.path.exists(MODEL_PATH):
@@ -463,7 +572,7 @@ if __name__ == "__main__":
         model = MaskablePPO.load(MODEL_PATH, env)
     else:
         model = MaskablePPO("CnnPolicy", env,
-                            learning_rate=0.00005,
+                            learning_rate=0.0001,
                             ent_coef=0.02,
                             n_steps=512,
                             batch_size=64,
@@ -478,6 +587,9 @@ if __name__ == "__main__":
 
     model.n_steps = 256
     model.ent_coef=0.01
+    #model.learning_rate=0.0001  <<---- does not work
+    #model.lr_schedule = lambda _: 0.0001 <---- this works
+    print("Learning rate: ", model.learning_rate)
     print("ent_coef:", model.ent_coef)
     print("num steps:", model.n_steps)
     print("Epochs each rollout:", model.n_epochs)

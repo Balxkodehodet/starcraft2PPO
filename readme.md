@@ -56,7 +56,7 @@ Bruk **Python 3.10**, da PySC2 krever denne versjonen.
 ### Python-pakker
 
 - `pysc2`
-- `gym` eller `gymnasium`
+- `gym` eller `gymnasium` <------ gymnasium blir brukt
 - `stable-baselines3`
 - `sb3-contrib` (for `MaskablePPO` dersom du bruker action masking)
 - `torch`
@@ -81,6 +81,9 @@ Anbefaling: Bruk en headless-versjon for raskere trening (visualize=False i SC2E
 Bruk
 Trening
 python train_maskable_ppo_sc2.py <<-- Denne filen er hoved agenten, filen fungerer og de andre fungerer ikke optimalt ennå.
+
+OPPDATERING: python v2_customCNN_ppo_10xdefault.py er den nyeste agenten med flere parametere da koden over produserte for få parametere og sakte trening etter flere millioner timesteps.. denne har 23.7 millioner parametere og tar opp flere 100MB plass å trene.
+Den anbefales å bruke da den har oppdaterte rewards og bedre reward shaping.
 
 Dette vil opprette flere parallelle miljøer og trene PPO-agenten mot en easy bot (ikke selv læring)
 

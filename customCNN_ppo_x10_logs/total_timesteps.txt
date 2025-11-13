@@ -1,0 +1,7 @@
+attempt_nr1 = 543744 total timesteps +
+attempt_nr2 = 141312  total timesteps +
+attempt_nr3 = 80 000 total timesteps +
+attemp_nr4 = 100 000 total timesteps +
+attempt_nr5 = 40 000 total timesteps +
+attempt_nr6 = 70 000 total timesteps +
+attempt_nr7 = 210 000 total timesteps +

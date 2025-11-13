@@ -25,8 +25,9 @@ from pysc2.lib import actions as sc2_actions, features
 import torch
 from sb3_contrib.common.maskable.utils import get_action_masks
 from sb3_contrib.common.wrappers.action_masker import ActionMasker
+from collections import deque
 
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecTransposeImage
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecTransposeImage, DummyVecEnv
 from sb3_contrib.ppo_mask import MaskablePPO
 
 # ---------------- CONFIG ----------------
@@ -34,7 +35,7 @@ MAP_NAME = "Simple64"
 STEP_MUL = 8
 FEATURE_SCREEN_SIZE = 84
 TOTAL_TIMESTEPS = 1000000
-NUM_ENVS = 2
+NUM_ENVS = 1
 MODEL_PATH = "maskableselfplay_ppo_sc2.zip"
 FROZEN_OPPONENT = "frozen_opponent.zip"
 # ---------------------------------------
@@ -92,6 +93,11 @@ class SC2ContinuousCNNEnv(gym.Env):
                                             shape=(FEATURE_SCREEN_SIZE, FEATURE_SCREEN_SIZE, 3),
                                             dtype=np.uint8)
 
+        # Store last actions so that it can be penalized if it is over 10 actions repeated
+        self.recent_actions = deque(maxlen=10)
+        self.repeated_action_count = 0
+
+
         # Track invalid actions + episode stats + valid actions
         self.invalid_action_count = 0
         self.valid_action_count = 0
@@ -133,13 +139,14 @@ class SC2ContinuousCNNEnv(gym.Env):
                 args.append([0])
 
         try:
-            return sc2_actions.FunctionCall(func.id, args)
+            return sc2_actions.FunctionCall(func.id, args), func, args
         except Exception as e:
             print(f"Error creating FunctionCall for {func.name}: {e}")
-            return sc2_actions.FUNCTIONS.no_op()
+            return sc2_actions.FUNCTIONS.no_op(), func, args
 
-    def set_opponent_policy(env, policy):
-        env.opponent_policy = policy
+    def set_opponent_policy(self, model):
+        self.opponent_policy_model = model
+
         
 
     def reset(self, seed=None, options=None):
@@ -244,17 +251,36 @@ class SC2ContinuousCNNEnv(gym.Env):
             if fid in available:
                 action_mask[idx] = 1.0
 
-            # --- Determine player 2 action ---
-        if hasattr(self, "opponent_policy") and self.opponent_policy is not None:
-            obs2 = self._last_obs2
-            action2, _ = self.opponent_policy.predict(obs2, deterministic=True)
-            func_id2, x2, y2 = int(action2[0]), float(action2[1]), float(action2[2])
-            action2_call = self._make_action(func_id2, x2, y2)
+        print("type of self.last_obs2: ", type(self._last_obs2))
+        # --- Determine player 2 action ---
+        if hasattr(self, "opponent_policy_model") and self.opponent_policy_model is not None:
+            with torch.no_grad():
+                action2, _ = self.opponent_policy_model.predict(self._last_obs2.observation, action_masks=action_mask,  # ✅ this ensures only valid funcs are picked:
+                                                            deterministic=True)
+                func_id2, x2, y2 = int(action2[0]), float(action2[1]), float(action2[2])
+                action2_call, _, _ = self._make_action(func_id2, x2, y2)
         else:
-            action2_call = sc2_actions.FUNCTIONS.no_op()
+            action2_call, _, _ = sc2_actions.FUNCTIONS.no_op()
 
         # --- Player 1 FunctionCall ---
-        action1_call = self._make_action(func_id, x, y)
+        action1_call, func, args = self._make_action(func_id, x, y)
+
+        # --- Detect repeated actions ---
+        action_signature = (func.id, tuple(map(tuple, args)))  # hashable
+        self.recent_actions.append(action_signature)
+
+        # Count how many times the last action has been repeated
+        if len(self.recent_actions) >= 2 and all(a == self.recent_actions[-1] for a in list(self.recent_actions)[-10:]):
+            self.repeated_action_count += 1
+            repeat_penalty = -0.05 * self.repeated_action_count  # scale penalty with frequency
+        else:
+            self.repeated_action_count = 0
+            repeat_penalty = 0.0
+
+
+        if repeat_penalty < 0:
+            print(f"⚠️ Over 10 Repeated actions detected ({self.repeated_action_count+10}x) | Penalty: {repeat_penalty:.3f}")
+
 
         # --- Step environment ---
         obs = self.sc2_env.step([action1_call, action2_call])
@@ -272,16 +298,18 @@ class SC2ContinuousCNNEnv(gym.Env):
         # --- Player contains = ['player_id', 'minerals', 'vespene', 'food_used', 'food_cap',
         # --- 'food_army', 'food_workers', 'idle_worker_count', 'army_count', 'warp_gate_count', 'larva_count'] 
         try:
-            score_cumulative = obs1.observation["score_cumulative"]
-            player_obs = obs1.observation["player"]
+            score_cumulative = obs.observation["score_cumulative"]
+            player_obs = obs.observation["player"]
             score = score_cumulative[0]
             gathered = score_cumulative[7]
+            vespene = score_cumulative[8]
             workers = player_obs[6]
             idle_workers = player_obs[7]
             supply_despot = player_obs[4]
+            army_power = player_obs[5]
         except (KeyError, AttributeError, TypeError):
             print("KeyError, AttributeError or TypeError")
-            score = gathered = workers = idle_workers = supply_despot = 0.0
+            score = gathered = vespene = army_power = workers = idle_workers = supply_despot = 0.0
 
         #print(f"gathered minerals:",gathered)
         #print(f"score:", score)
@@ -299,27 +327,46 @@ class SC2ContinuousCNNEnv(gym.Env):
             delta_workers = workers - self._prev_workers
             delta_idle_workers = idle_workers - self._prev_idle_workers
             delta_supply_despot = supply_despot - self._prev_supply_despot
+            delta_vespene = vespene - self._prev_vespene
+            delta_army_power = army_power - self._prev_army_power
         else:
-            delta_score = delta_minerals = delta_workers = delta_idle_workers = delta_supply_despot = 0
+            delta_score = delta_minerals = delta_vespene = delta_army_power = delta_workers = delta_idle_workers = delta_supply_despot = 0
 
         #print("delta minerals:", delta_minerals)
         #print("delta score:", delta_score)
 
+        first_time_reward = 0
+        #Reward the first time it builds a supply despot or if episode reward is above 20
+        if self._first_time == 1:
+            if delta_supply_despot > 0 or delta_workers > 0:
+                self._first_time = 2
+                first_time_reward = 2.0
+                print(f"Congratulations! You did something good for the first time! Rewarded {first_time_reward} extra points")
+
+        # Set first time +1 ONLY if it is the first time it steps to avoid rewards being given for free because prevs are 0
+        if self._first_time == 0:
+            self._first_time += 1
+        
+        
         self._prev_score = score
         #self._prev_kills = killed
         self._prev_minerals = gathered
         self._prev_workers = workers
         self._prev_idle_workers = idle_workers
         self._prev_supply_despot = supply_despot
+        self._prev_vespene = vespene
+        self._prev_army_power = army_power
 
         # --- Normalization ---
         # Cap large jumps to keep PPO stable
-        delta_score = np.clip(delta_score, -100, 100) / 100.0
-        #delta_kills = np.clip(delta_kills, -50, 50) / 50.0
-        delta_minerals = np.clip(delta_minerals, -500, 500) / 500.0
-        delta_workers = np.clip(delta_workers, -5, 5) / 5.0
+        delta_score = np.clip(delta_score, -100, 100) / 100.0 # General Score
+        #delta_kills = np.clip(delta_kills, -50, 50) / 50.0 # Kills (not yet found)
+        delta_minerals = np.clip(delta_minerals, -500, 500) / 500.0 # Minerals gathered
+        delta_workers = np.clip(delta_workers, -5, 5) / 5.0 # Power of workers 
         delta_idle_workers = np.clip(delta_idle_workers, 0, 20) / 20.0  # only penalize positive idle change
-        delta_supply_despot = np.clip(delta_supply_despot, -8, 8) / 8.0
+        delta_supply_despot = np.clip(delta_supply_despot, -8, 8) / 8.0 # Supply despots nr
+        delta_vespene = np.clip(delta_vespene, -500, 500) / 500.0 # Vespene gathered
+        delta_army_power = np.clip(delta_army_power, -5, 5) / 5.0 # Army power
 
         #print("delta minerals after cap:", delta_minerals)
         #print("delta score after cap:", delta_score)
@@ -337,14 +384,18 @@ class SC2ContinuousCNNEnv(gym.Env):
             0.5 * reward
             + 0.3 * delta_score
             #+ 0.15 * delta_kills
+            + 0.15 * delta_army_power #reward for having supply used for army units  
+            + 0.05 * delta_vespene
             + 0.05 * delta_minerals
             + 0.05 * delta_workers  # reward for training new workers
             + 0.1 * delta_supply_despot
             - 0.2 * delta_idle_workers  # penalize idle workers
         )
 
-        # track episode total
-        self.episode_reward += shaped_reward
+        # Add penalty from repeated actions
+        shaped_reward += repeat_penalty
+
+        shaped_reward += first_time_reward
         
         done = obs1.last()
         info = {"action_mask": action_mask}
@@ -398,11 +449,11 @@ def make_env(mask_fn):
     return _init
 
 if __name__ == "__main__":
-    #env = DummyVecEnv([make_env])
+    #env = DummyVecEnv([make_env(mask_fn)])
 
     # Use SubprocVecEnv to run each env in a separate process
     env_fns = [make_env(mask_fn) for i in range(NUM_ENVS)]  # call make_env
-    env = SubprocVecEnv(env_fns)
+    env = SubprocVecEnv(env_fns)#DummyVecEnv(env_fns) 
     env = VecTransposeImage(env) #CNN-friendly format
 
     print(f"Created {NUM_ENVS} SC2 environments in parallel.")
@@ -413,11 +464,12 @@ if __name__ == "__main__":
         print(f"Loading existing model from {MODEL_PATH}")
         model = MaskablePPO.load(MODEL_PATH, env)
     else:
+        print("Creating new model")
         model = MaskablePPO("CnnPolicy", env,
-                            learning_rate=0.00005,
+                            learning_rate=0.0001,
                             ent_coef=0.01,
-                            n_steps=512,
-                            batch_size=64,
+                            n_steps=1024,
+                            batch_size=256,
                             gamma=0.99,
                             gae_lambda=0.95,
                             max_grad_norm=0.5,
@@ -426,6 +478,30 @@ if __name__ == "__main__":
                             device="cuda",
                             tensorboard_log="./selfplay_maskable_ppo_sc2_logs/")
 
+
+        # --- Load or create frozen opponent ---
+    if os.path.exists(FROZEN_OPPONENT):
+        print(f"🔄 Loading frozen opponent from {FROZEN_OPPONENT}")
+        frozen_opponent = MaskablePPO.load(FROZEN_OPPONENT, env)
+    else:
+        print("🧊 Creating initial frozen opponent (copy of current model)")
+        # --- Create a frozen copy of the current model safely ---
+        frozen_opponent = copy.deepcopy(model.policy)
+        
+
+        # --- Inject opponent into each environment instance ---
+    for env_idx in range(env.num_envs):
+            #env.envs[idx].opponent_policy = frozen_opponent
+
+            env.env_method('set_opponent_policy', frozen_opponent, indices=[env_idx])
+
+    print("🤝 Opponent policy injected into all environments.")    
+
+
+    print("model.action space:", model.action_space)
+    print("env.action space:", env.action_space)
+    print("frozen opponent action space:",frozen_opponent.action_space)
+    
     print("ent_coef:", model.ent_coef)
     print("num steps:", model.n_steps)
     print("Epochs each rollout:", model.n_epochs)
@@ -439,26 +515,22 @@ if __name__ == "__main__":
     timesteps_done = 0
     while timesteps_done < TOTAL_TIMESTEPS:
         #env.env_method("set_opponent_policy", policy)
-
-        if os.path.exists(FROZEN_OPPONENT):
-            print(f"Loading existing opponent model from {FROZEN_OPPONENT}")
-            frozen_opponent = MaskablePPO.load(FROZEN_OPPONENT)
-            for env_idx in range(NUM_ENVS):
-                env.env_method('set_opponent_policy', frozen_opponent.predict, indices=[env_idx])
-        else:
-            print(f"Loading opponent model from existing Original model: {MODEL_PATH}")
-            frozen_opponent = MaskablePPO.load(MODEL_PATH)
-            for env_idx in range(NUM_ENVS):
-                env.env_method('set_opponent_policy', frozen_opponent.predict, indices=[env_idx])
-                
+            
         # Train for a chunk
         model.learn(total_timesteps=UPDATE_OPPONENT_EVERY, reset_num_timesteps=False, callback=save_callback)
         timesteps_done += UPDATE_OPPONENT_EVERY
 
         # --- Update frozen opponent in each env ---
-        frozen_opponent = copy.deepcopy(model)  # freeze current model
+        frozen_opponent = copy.deepcopy(model.policy)
         for env_idx in range(NUM_ENVS):
-            env.env_method('set_opponent_policy', frozen_opponent.predict, indices=[env_idx])
+            env.env_method('set_opponent_policy', frozen_opponent, indices=[env_idx])
+
+        # Assign the frozen opponent **directly to each env**
+        for e in env.envs:  # env.envs is the list of actual env instances in DummyVecEnv
+            # unwrap to get the underlying SC2ContinuousCNNEnv
+            raw_env = e.env if hasattr(e, "env") else e
+            raw_env.set_opponent_policy(frozen_opponent)
+            
 
         print(f"Updated frozen opponent at {timesteps_done} steps")
 
